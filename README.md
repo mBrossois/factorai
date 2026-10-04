@@ -26,6 +26,11 @@ The orchestrator seeds a demo floor on first boot (a local sandbox repo with two
 wizards, three orders and two bottled PRs) so the castle is not empty. Set
 `FACTORAI_SEED=0` to skip it.
 
+Every floor you bind gets a board file in `kanbanboard/` at the project root -
+one plain JSON file per repository, rewritten whenever a task is filed, moved or
+assigned. The next start reads them back, so the castle returns as you left it.
+Set `FACTORAI_KANBAN=0` for a castle that resets on every boot.
+
 Production:
 
 ```bash
@@ -73,6 +78,27 @@ The HUD shows a dot per CLI (`claude`, `kilo`, `gh`, `glab`) so you can see at a
 glance what this host can actually drive. Missing tooling is never fatal: an
 unusable floor is labelled `unlinked` and says why on its plaque.
 
+### The castle remembers itself
+
+`kanbanboard/<owner>__<repo>.json` is the record of one floor: the repository it
+was bound to, the wizards on its desks, and every potion order on its kanban
+with the column, the priority and the wizard holding it. Because it is plain JSON in your repository
+you can read it, diff it, edit it by hand, or commit it and get the same castle
+on another machine.
+
+```json
+{
+  "version": 1,
+  "repo": { "slug": "acme/wand-core", "name": "Wand core", "provider": "github" },
+  "wizards": [{ "name": "Huffle", "type": "kilo" }],
+  "tasks": [{ "title": "Polish the wand runes", "status": "in-progress", "priority": "high", "agent": "Huffle" }]
+}
+```
+
+Everything the office adds comes back - repository, desks, orders - which means
+a floor set up once stays set up. Wizards are re-created **idle**: an order is
+remembered, the process that was doing the work is not.
+
 ## Running an agent
 
 1. File a **potion order** (issue) on a floor.
@@ -99,6 +125,7 @@ server/                     the orchestrator (Node + Express + ws)
   git/gitlab.ts             glab wrapper
   git/parsers.ts            pure, defensive CLI-output parsers (unit tested)
   state/store.ts            in-memory swarm state
+  state/boards.ts           one JSON kanban board per floor - the castle memory
   state/events.ts           WebSocket hub
 src/
   core/                     shared types + wire protocol (used by both sides)
@@ -133,8 +160,9 @@ docs/
 
 ## Known limits
 
-- **No persistence.** State is in-memory; restarting the orchestrator resets the
-  castle. Deliberate for v1.
+- **Only the boards persist.** Floors, their kanban tasks and who holds them
+  survive a restart from `kanbanboard/`. Wizards, spell books, PR check state and
+  agent processes do not: they are re-derived or simply gone.
 - **No sandboxing.** The orchestrator runs agents with the full privileges of the
   user that started it. It binds to `127.0.0.1` by default — do not expose it.
 - **No swarm scheduling.** One agent per issue, manual assignment. Dependency

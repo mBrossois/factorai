@@ -38,7 +38,10 @@ export default function App() {
   const safeLevel = Math.min(level, floors.length);
 
   const openPanel = useCallback((next: Panel) => setPanel(next), []);
-  const closePanel = useCallback(() => setPanel({ kind: 'none' }), []);
+  const closePanel = useCallback(() => {
+    setPanel({ kind: 'none' });
+    if (hasEntered) controls.current?.requestLock();
+  }, [hasEntered]);
 
   const onControls = useCallback((api: FirstPersonApi) => {
     controls.current = api;

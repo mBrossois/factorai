@@ -16,7 +16,7 @@
     "preview": "npm run build && npm run start",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "tsx --test server/git/parsers.test.ts server/agents/claude.test.ts server/state/store.test.ts",
+    "test": "tsx --test server/git/parsers.test.ts server/agents/claude.test.ts server/state/store.test.ts server/state/boards.test.ts",
     "check": "npm run typecheck && npm run lint && npm run test && npm run build"
   },
   "dependencies": {
