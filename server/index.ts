@@ -21,8 +21,16 @@ import express from 'express';
 import { AgentManager, probeAgentClis, runnerVersion } from './agents/manager';
 import { providerFor } from './git';
 import { CLIENT_MESSAGE_TYPES, type ClientMessage } from '../src/core/protocol';
-import type { Issue, Repo, Theme } from '../src/core/types';
+import type { Agent, Issue, Repo, Theme } from '../src/core/types';
 import { THEMES } from '../src/core/types';
+import {
+  BoardStore,
+  boardFrom,
+  boardsEnabled,
+  type BoardFile,
+  type BoardTask,
+  type BoardWizard,
+} from './state/boards';
 import { hub, errorMessage } from './state/events';
 import { store } from './state/store';
 import { dirExists, ensureDir, expandPath, hasCli } from './util/cli';
@@ -34,6 +42,9 @@ const DEMO_SANDBOX = join(process.cwd(), 'server', '.workspaces', 'demo');
 
 let pollSeconds = clampSeconds(process.env.FACTORAI_POLL_SECONDS ?? 45);
 const agents = new AgentManager(store, hub);
+const boards = new BoardStore();
+/** Repos with a poll in flight, so two timers never reconcile the same floor. */
+const syncing = new Set<string>();
 
 /* ------------------------------------------------------------------ *
  * Boot
@@ -47,6 +58,11 @@ store.capabilities = {
   version: '0.1.0',
 };
 log('capabilities', JSON.stringify(store.capabilities));
+
+// The floors and their potion orders are read back from disk before anything
+// else looks at the store, so a restart rebuilds the castle instead of
+// resetting it.
+await restoreBoards();
 
 if (process.env.FACTORAI_SEED !== '0' && store.listRepos().length === 0) {
   seedDemoCastle();
@@ -140,7 +156,6 @@ server.listen(PORT, HOST, () => {
  * Polling
  * ------------------------------------------------------------------ */
 
-const syncing = new Set<string>();
 let pollTimer: NodeJS.Timeout | null = null;
 
 function schedulePolling(): void {
@@ -205,6 +220,8 @@ async function syncOne(repo: Repo): Promise<void> {
     }
   }
 
+  persist(repo.id);
+
   const known = store.prsForRepo(repo.id);
   for (const remote of await provider.listPrs(repo.slug)) {
     const existing = known.find((p) => p.number === remote.number);
@@ -225,6 +242,116 @@ async function syncOne(repo: Repo): Promise<void> {
     });
     hub.send({ t: 'prCreated', payload: pr });
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Boards - the castle's memory on disk
+ *
+ * One JSON file per floor under `<project>/kanbanboard/`. Adding a repository
+ * writes its board, every kanban change rewrites it, and the next boot reads
+ * them all back. Nothing else survives a restart: wizards are processes, and PRs
+ * and check state come back from the provider poller anyway.
+ * ------------------------------------------------------------------ */
+
+/** Every order on a floor, as the board file records it. */
+function boardTasksFor(repoId: string): BoardTask[] {
+  return store.issuesForRepo(repoId).map((issue) => {
+    const agent = issue.assigneeId ? store.getAgent(issue.assigneeId) : null;
+    return {
+      title: issue.title,
+      body: issue.body,
+      status: issue.status,
+      priority: issue.priority,
+      number: issue.number,
+      url: issue.url,
+      agent: agent?.name ?? null,
+      agentType: agent?.type ?? null,
+      createdAt: issue.createdAt,
+    };
+  });
+}
+
+/** Every wizard on a floor, by name and type: a desk is worth remembering. */
+function boardWizardsFor(repoId: string): BoardWizard[] {
+  return store.agentsForRepo(repoId).map((agent) => ({ name: agent.name, type: agent.type }));
+}
+
+/** Queue a floor's board for writing; writes are coalesced and atomic. */
+function persist(repoId: string): void {
+  if (!boardsEnabled()) return;
+  const repo = store.getRepo(repoId);
+  if (!repo) return;
+  boards.schedule(boardFrom(repo, boardWizardsFor(repo.id), boardTasksFor(repo.id)));
+}
+
+/** Rebuild every floor that has a board file: the repository, then its orders. */
+async function restoreBoards(): Promise<void> {
+  if (!boardsEnabled()) {
+    log('boards', 'off (FACTORAI_KANBAN=0) - a restart resets the castle');
+    return;
+  }
+
+  const loaded = await boards.load();
+  if (loaded.length === 0) {
+    log('boards', `none in ${boards.dir}`);
+    return;
+  }
+
+  let restored = 0;
+  for (const { board } of loaded) {
+    try {
+      await restoreFloor(board);
+      restored += 1;
+    } catch (err) {
+      log('restore failed', `${board.repo.slug}: ${errorMessage(err)}`);
+    }
+  }
+  log('boards', `restored ${restored} floor(s) from ${boards.dir}`);
+}
+
+async function restoreFloor(board: BoardFile): Promise<void> {
+  let repo = store.listRepos().find((r) => r.slug === board.repo.slug);
+  if (!repo) {
+    repo = store.addRepo({
+      slug: board.repo.slug,
+      provider: board.repo.provider,
+      name: board.repo.name,
+      url: board.repo.url,
+      localPath: board.repo.localPath,
+      theme: board.repo.theme,
+    });
+  }
+
+  // The desks first, so the wizard an order names is one that was already there.
+  const wizards = new Map<string, Agent>();
+  for (const desk of board.wizards) {
+    const wizard = store.addAgent({ repoId: repo.id, type: desk.type, name: desk.name });
+    wizards.set(`${desk.type}:${desk.name}`, wizard);
+  }
+
+  for (const task of board.tasks) {
+    const issue = store.addIssue({
+      repoId: repo.id,
+      title: task.title,
+      body: task.body,
+      priority: task.priority,
+      number: task.number,
+      url: task.url,
+    });
+    store.setIssueStatus(issue.id, task.status);
+    if (!task.agent) continue;
+    const key = `${task.agentType ?? 'claude'}:${task.agent}`;
+    let wizard = wizards.get(key);
+    if (!wizard) {
+      wizard = store.addAgent({ repoId: repo.id, type: task.agentType ?? 'claude', name: task.agent });
+      wizards.set(key, wizard);
+    }
+    store.updateIssue(issue.id, { assigneeId: wizard.id });
+  }
+
+  log('restored', `floor ${board.repo.slug} with ${board.tasks.length} order(s)`);
+  // The provider decides what is connected and brings in PRs and check state.
+  void syncRepo(repo.id);
 }
 
 /* ------------------------------------------------------------------ *
@@ -272,13 +399,17 @@ async function handle(
         localPath: message.payload.localPath,
         theme,
       });
+      persist(repo.id);
       void syncRepo(repo.id);
       return { repoId: repo.id };
     }
 
     case 'removeRepo': {
+      const repo = store.getRepo(message.payload.repoId);
       for (const agent of store.agentsForRepo(message.payload.repoId)) agents.kill(agent.id, 'floor removed');
       store.removeRepo(message.payload.repoId);
+      // The board file is the floor's memory, so unbinding takes it with it.
+      if (repo) void boards.forget(repo.slug);
       return undefined;
     }
 
@@ -301,6 +432,7 @@ async function handle(
         assigneeId: message.payload.assigneeId,
       });
       hub.send({ t: 'issueUpdated', payload: issue });
+      persist(repo.id);
 
       if (message.payload.pushRemote !== false && repo.connected && !repo.localPath) {
         void pushIssue(repo, issue.id);
@@ -312,6 +444,7 @@ async function handle(
       const issue = store.setIssueStatus(message.payload.issueId, message.payload.status);
       if (!issue) throw new Error('unknown potion order');
       hub.send({ t: 'issueUpdated', payload: issue });
+      persist(issue.repoId);
       return undefined;
     }
 
@@ -320,23 +453,34 @@ async function handle(
       if (!repo) throw new Error('unknown floor');
       const type = message.payload.type === 'kilo' ? 'kilo' : 'claude';
       const agent = store.addAgent({ repoId: repo.id, type, name: message.payload.name });
+      persist(repo.id);
       return { agentId: agent.id };
     }
 
     case 'removeAgent': {
+      const agent = store.getAgent(message.payload.agentId);
       agents.kill(message.payload.agentId, 'dismissed');
       store.removeAgent(message.payload.agentId);
+      if (agent) persist(agent.repoId);
       return undefined;
     }
 
     case 'assignAgent': {
       await agents.assign(message.payload.agentId, message.payload.issueId);
+      const assigned = store.getIssue(message.payload.issueId);
+      if (assigned) persist(assigned.repoId);
       return undefined;
     }
 
     case 'unassignAgent': {
       const agent = store.getAgent(message.payload.agentId);
-      if (agent) store.updateAgent(agent.id, { currentTaskId: null });
+      if (agent) {
+        const repoId = agent.repoId;
+        store.updateAgent(agent.id, { currentTaskId: null });
+        for (const issue of store.issuesForRepo(repoId)) {
+          if (issue.assigneeId === agent.id) persist(repoId);
+        }
+      }
       return undefined;
     }
 
@@ -413,6 +557,7 @@ async function pushIssue(repo: Repo, issueId: string): Promise<void> {
       body: issue.body,
     });
     store.updateIssue(issue.id, { number: remote.number, url: remote.url });
+    persist(repo.id);
     hub.send({ t: 'notice', payload: `potion order filed upstream: ${remote.url || remote.number}` });
   } catch (err) {
     hub.send({ t: 'error', payload: `could not file upstream: ${errorMessage(err)}` });
@@ -487,6 +632,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     if (shuttingDown) return;
     shuttingDown = true;
     log('shutdown', `received ${signal}, releasing every agent…`);
+    void boards.flush();
     agents.stopAll();
     if (pollTimer) clearInterval(pollTimer);
     void hub.close().finally(() => server.close(() => process.exit(0)));

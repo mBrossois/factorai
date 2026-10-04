@@ -148,12 +148,68 @@ These parsers are the project's main unit-tested surface (12 tests).
   assignee: a poll will never stomp on work in flight.
 - Upsert PRs by number, and fire `prCreated` for genuinely new ones so a potion
   materialises on the shelf.
+- Rewrite the floor's board file, so an order found upstream is remembered too.
 - Fetch check state per open PR; that is what drives the cauldron's colour and
   boil rate.
 
 Concurrent syncs of the same repo are suppressed. Removing a repo kills its
 agents first, then compacts the remaining floor numbers so the castle never has a
 gap.
+
+## Boards - the castle's memory on disk
+
+Every floor owns one board file: `kanbanboard/<owner>__<repo>.json` at the
+project root. `FACTORAI_KANBAN_DIR` moves the folder, `FACTORAI_KANBAN=0` turns
+persistence off. Binding a repository writes its board, every kanban change
+rewrites it, and the next boot reads them all back - so a restart rebuilds the
+castle instead of resetting it.
+
+Plain JSON on purpose: a board can be read, diffed, hand-edited or committed
+like any other file in the repository, and copied to another machine to move a
+castle.
+
+```json
+{
+  "version": 1,
+  "repo": { "slug": "acme/wand-core", "name": "Wand core", "provider": "github",
+            "url": "https://github.com/acme/wand-core", "localPath": null, "theme": "library" },
+  "wizards": [{ "name": "Huffle", "type": "kilo" }],
+  "tasks": [{
+    "title": "Polish the wand runes", "body": "", "status": "in-progress",
+    "priority": "high", "number": null, "url": null,
+    "agent": "Huffle", "agentType": "kilo", "createdAt": 1791111100410
+  }],
+  "savedAt": 1791111100773
+}
+```
+
+| Moment | What is written |
+| --- | --- |
+| `createRepo` | a new board file for the floor |
+| `createIssue`, `setIssueStatus` | the order, in the column it was moved to |
+| `createAgent`, `removeAgent` | the desks on the floor |
+| `assignAgent`, `unassignAgent` | the wizard holding it, by name and type |
+| a provider poll | whatever the poll reconciled, so remote orders are remembered too |
+| `pushIssue` | the upstream number and URL the order acquired |
+| `removeRepo` | nothing - the board file goes with the floor |
+| `SIGINT` / `SIGTERM` | any queued write is flushed before exit |
+
+`BoardStore` (`server/state/boards.ts`) does the disk work. Writes are
+**debounced** per floor and **atomic** (temp file + `rename`): a kanban drag
+fires a store mutation per frame, and a crash mid-write must not truncate a
+board. Reading is defensive in the spirit of `parsers.ts` - a file that is not
+JSON, or JSON without a `repo.slug`, is logged and skipped rather than restored
+as nonsense, so one bad file costs you one floor and not the whole castle.
+
+On boot `restoreBoards()` walks the folder, re-raises each floor (slug, name,
+provider, local path, theme), re-creates every desk it had, replays every order
+with its column, priority and upstream number, hands each order back to the
+wizard that was holding it, and then hands the floor to the provider poller. The demo seed only runs when the folder was
+empty, so a real castle is never diluted with a demo floor.
+
+A restored wizard is **idle**: the desk and its orders are remembered, the
+process that was doing the work is not. That covers everything the office adds -
+repositories, wizards and potion orders - so a floor set up once stays set up.
 
 ## Local-only floors
 
@@ -168,8 +224,12 @@ the orchestrator any remote credentials.
 
 ## State model
 
-In-memory only; restarting the orchestrator resets the castle. This is an
-explicit v1 boundary, not an oversight.
+Two layers. **On disk**, one JSON board per floor under `kanbanboard/` records
+the repository and every order on its kanban - see
+[Boards](#boards---the-castles-memory-on-disk). **In memory** live the rest:
+wizards, their spell-book log tails, PRs and check state, rebuilt from the boards
+and the provider on every start. `FACTORAI_KANBAN=0` removes the disk layer and
+brings back the reset-on-restart behaviour.
 
 One deviation from the plan's sketch: it drew `Issue.assignee: Agent | null` and
 `PullRequest.author: Agent`. That is a cycle (`Agent.currentTask → Issue →
@@ -223,6 +283,8 @@ The same actions are exposed over REST (`POST /api/repos`, `/api/issues`,
 | `FACTORAI_CLAUDE_BIN` | `claude` | Claude Code binary |
 | `FACTORAI_KILO_BIN` | `kilo` | Kilo binary |
 | `FACTORAI_KILO_ARGS` | `["run","%PROMPT%"]` | Kilo argv template |
+| `FACTORAI_KANBAN` | on | set to `0` to stop persisting floors to disk |
+| `FACTORAI_KANBAN_DIR` | `<project>/kanbanboard` | where the board files live |
 
 ## Security
 
